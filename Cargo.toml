@@ -1,0 +1,10 @@
+[package]
+name = "ratatui-showcase"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive TUI showcase demonstrating ratatui widgets, layouts, and patterns"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
