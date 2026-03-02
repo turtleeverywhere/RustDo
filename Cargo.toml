@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "Interactive TUI showcase demonstrating ratatui widgets, layouts, and patterns"
 license = "MIT"
+build = "build.rs"
 
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
 rusqlite = { version = "0.31", features = ["bundled"] }
 dirs = "5"
+
+[build-dependencies]
+image = "0.25"
+ico = "0.4"
+winres = "0.1"
