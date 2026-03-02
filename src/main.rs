@@ -14,12 +14,12 @@
 ///   q / Esc           — quit
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -105,6 +105,7 @@ struct Project {
 struct TodoItem {
     text: String,
     done: bool,
+    created_at: i64,
 }
 
 impl App {
@@ -322,6 +323,7 @@ impl App {
                 project.todos.push(TodoItem {
                     text: self.todo_input.drain(..).collect(),
                     done: false,
+                    created_at: now_unix_secs(),
                 });
                 self.todo_state.select(Some(project.todos.len() - 1));
             }
@@ -370,10 +372,55 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             project_id INTEGER NOT NULL,
             text       TEXT    NOT NULL,
             done       INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0,
             position   INTEGER NOT NULL,
             FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );",
-    )
+    )?;
+
+    migrate_todos_created_at(conn)
+}
+
+fn migrate_todos_created_at(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(todos)")?;
+    let has_created_at = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .any(|column_name| column_name == "created_at");
+
+    if !has_created_at {
+        conn.execute(
+            "ALTER TABLE todos ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE todos SET created_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE created_at = 0",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn todo_fire_badge(created_at: i64, now: i64, done: bool) -> &'static str {
+    if done || created_at <= 0 || now <= created_at {
+        return "";
+    }
+
+    let age_days = ((now - created_at) / 86_400) as i32;
+    match age_days {
+        0 => "",
+        1 | 2 => " 🔥",
+        3 | 4 => " 🔥🔥",
+        _ => " 🔥🔥🔥",
+    }
 }
 
 fn load_projects(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
@@ -385,12 +432,13 @@ fn load_projects(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
     let mut projects = Vec::new();
     for (id, name) in project_rows {
         let mut todo_stmt =
-            conn.prepare("SELECT text, done FROM todos WHERE project_id = ?1 ORDER BY position")?;
+            conn.prepare("SELECT text, done, created_at FROM todos WHERE project_id = ?1 ORDER BY position")?;
         let todos: Vec<TodoItem> = todo_stmt
             .query_map(params![id], |row| {
                 Ok(TodoItem {
                     text: row.get(0)?,
                     done: row.get::<_, bool>(1)?,
+                    created_at: row.get(2)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -414,8 +462,8 @@ fn save_projects(conn: &Connection, projects: &[Project]) -> rusqlite::Result<()
         let project_id = conn.last_insert_rowid();
         for (todo_pos, todo) in project.todos.iter().enumerate() {
             tx.execute(
-                "INSERT INTO todos (project_id, text, done, position) VALUES (?1, ?2, ?3, ?4)",
-                params![project_id, todo.text, todo.done, todo_pos],
+                "INSERT INTO todos (project_id, text, done, created_at, position) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![project_id, todo.text, todo.done, todo.created_at, todo_pos],
             )?;
         }
     }
@@ -424,22 +472,23 @@ fn save_projects(conn: &Connection, projects: &[Project]) -> rusqlite::Result<()
 }
 
 fn default_projects() -> Vec<Project> {
+    let now = now_unix_secs();
     vec![
         Project {
             name: "Learn Ratatui".into(),
             todos: vec![
-                TodoItem { text: "Learn ratatui basics".into(), done: true },
-                TodoItem { text: "Build a layout with constraints".into(), done: true },
-                TodoItem { text: "Add keyboard navigation".into(), done: false },
-                TodoItem { text: "Style widgets with colors".into(), done: false },
+                TodoItem { text: "Learn ratatui basics".into(), done: true, created_at: now - 6 * 86_400 },
+                TodoItem { text: "Build a layout with constraints".into(), done: true, created_at: now - 4 * 86_400 },
+                TodoItem { text: "Add keyboard navigation".into(), done: false, created_at: now - 2 * 86_400 },
+                TodoItem { text: "Style widgets with colors".into(), done: false, created_at: now - 5 * 86_400 },
             ],
         },
         Project {
             name: "Build App".into(),
             todos: vec![
-                TodoItem { text: "Create a stateful list".into(), done: false },
-                TodoItem { text: "Handle events in a loop".into(), done: false },
-                TodoItem { text: "Deploy to production 🚀".into(), done: false },
+                TodoItem { text: "Create a stateful list".into(), done: false, created_at: now - 1 * 86_400 },
+                TodoItem { text: "Handle events in a loop".into(), done: false, created_at: now - 3 * 86_400 },
+                TodoItem { text: "Deploy to production 🚀".into(), done: false, created_at: now - 7 * 86_400 },
             ],
         },
     ]
@@ -460,7 +509,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, projects);
+    let result = run_app(&mut terminal, &conn, projects);
 
     disable_raw_mode()?;
     execute!(
@@ -484,6 +533,7 @@ fn main() -> io::Result<()> {
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    conn: &Connection,
     projects: Vec<Project>,
 ) -> io::Result<Vec<Project>> {
     let mut app = App::new(projects);
@@ -498,6 +548,12 @@ fn run_app(
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
+                // Process only real key presses to avoid duplicate handling on platforms
+                // that also emit Repeat/Release events (notably Windows).
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
                 // If adding a todo, handle text input
                 if app.adding_todo {
                     match key.code {
@@ -558,6 +614,11 @@ fn run_app(
                 // Global keys
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+                    KeyCode::Char('s') => {
+                        if let Err(e) = save_projects(conn, &app.projects) {
+                            eprintln!("Warning: failed to save data: {e}");
+                        }
+                    }
                     KeyCode::Tab => {
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             app.prev_tab();
@@ -782,6 +843,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 // ============================================================
 
 fn draw_todo_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    let now = now_unix_secs();
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -846,12 +908,13 @@ fn draw_todo_tab(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         ("○", Style::default().fg(Color::White))
                     };
+                    let fire_badge = todo_fire_badge(todo.created_at, now, todo.done);
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             format!(" {icon} "),
                             Style::default().fg(if todo.done { Color::Green } else { Color::DarkGray }),
                         ),
-                        Span::styled(&todo.text, style),
+                        Span::styled(format!("{}{}", todo.text, fire_badge), style),
                     ]))
                 })
                 .collect();
@@ -942,6 +1005,10 @@ fn draw_todo_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(vec![
             Span::styled("  d/Del", Style::default().fg(Color::Yellow).bold()),
             Span::raw("     Delete item"),
+        ]),
+        Line::from(vec![
+            Span::styled("  s", Style::default().fg(Color::Yellow).bold()),
+            Span::raw("         Save data"),
         ]),
     ];
 
@@ -1275,6 +1342,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         Line::from(Span::styled("  Global", Style::default().fg(Color::Yellow).bold())),
         Line::from("    Tab / Shift+Tab   Switch tabs"),
         Line::from("    ?                 Toggle this help"),
+        Line::from("    s                 Save data"),
         Line::from("    q / Esc           Quit"),
         Line::from(""),
         Line::from(Span::styled("  Todo Tab", Style::default().fg(Color::Yellow).bold())),
