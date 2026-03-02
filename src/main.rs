@@ -6,13 +6,17 @@
 /// Controls:
 ///   Tab / Shift+Tab  — switch tabs
 ///   ↑/↓ or j/k       — navigate lists/tables
+///   ←/→ or h/l        — switch pane (in Todo tab)
 ///   Enter             — toggle/select items
-///   a                 — add item (in Todo tab)
+///   a                 — add project or todo (in Todo tab)
 ///   d/Delete          — delete item (in Todo tab)
 ///   +/-               — adjust gauge values
 ///   q / Esc           — quit
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use rusqlite::{params, Connection};
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -43,11 +47,15 @@ struct App {
     current_tab: usize,
     tab_titles: Vec<&'static str>,
 
-    /// Todo list state (Tab 0)
-    todos: Vec<TodoItem>,
+    /// Projects & Todos (Tab 0)
+    projects: Vec<Project>,
+    project_state: ListState,
     todo_state: ListState,
+    todo_focus: TodoFocus,
     adding_todo: bool,
     todo_input: String,
+    adding_project: bool,
+    project_input: String,
 
     /// Table state (Tab 1)
     table_data: Vec<Vec<String>>,
@@ -72,6 +80,26 @@ struct App {
 
     /// Popup visible
     show_help: bool,
+
+    /// Delete confirmation
+    confirm_delete: Option<DeleteTarget>,
+}
+
+#[derive(Clone)]
+enum DeleteTarget {
+    Project(usize),
+    Todo { project_idx: usize, todo_idx: usize },
+}
+
+#[derive(PartialEq)]
+enum TodoFocus {
+    Projects,
+    Todos,
+}
+
+struct Project {
+    name: String,
+    todos: Vec<TodoItem>,
 }
 
 struct TodoItem {
@@ -80,9 +108,19 @@ struct TodoItem {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(loaded_projects: Vec<Project>) -> Self {
+        let projects = if loaded_projects.is_empty() {
+            default_projects()
+        } else {
+            loaded_projects
+        };
+
+        let mut project_state = ListState::default();
+        project_state.select(if projects.is_empty() { None } else { Some(0) });
+
         let mut todo_state = ListState::default();
-        todo_state.select(Some(0));
+        let has_todos = projects.first().map_or(false, |p| !p.todos.is_empty());
+        todo_state.select(if has_todos { Some(0) } else { None });
 
         let mut table_state = TableState::default();
         table_state.select(Some(0));
@@ -91,18 +129,14 @@ impl App {
             current_tab: 0,
             tab_titles: vec!["📝 Todo", "📊 Table", "🔋 Gauges", "📈 Charts", "📖 About"],
 
-            todos: vec![
-                TodoItem { text: "Learn ratatui basics".into(), done: true },
-                TodoItem { text: "Build a layout with constraints".into(), done: true },
-                TodoItem { text: "Add keyboard navigation".into(), done: false },
-                TodoItem { text: "Style widgets with colors".into(), done: false },
-                TodoItem { text: "Create a stateful list".into(), done: false },
-                TodoItem { text: "Handle events in a loop".into(), done: false },
-                TodoItem { text: "Deploy to production 🚀".into(), done: false },
-            ],
+            projects,
+            project_state,
             todo_state,
+            todo_focus: TodoFocus::Projects,
             adding_todo: false,
             todo_input: String::new(),
+            adding_project: false,
+            project_input: String::new(),
 
             table_data: vec![
                 vec!["ratatui".into(), "0.29".into(), "TUI framework".into(), "★★★★★".into()],
@@ -130,6 +164,7 @@ impl App {
             should_quit: false,
             start_time: Instant::now(),
             show_help: false,
+            confirm_delete: None,
         }
     }
 
@@ -177,39 +212,105 @@ impl App {
         }
     }
 
+    // -- Project actions --
+
+    fn project_next(&mut self) {
+        let len = self.projects.len();
+        if len == 0 { return; }
+        let i = self.project_state.selected().unwrap_or(0);
+        self.project_state.select(Some((i + 1) % len));
+        self.reset_todo_selection();
+    }
+
+    fn project_prev(&mut self) {
+        let len = self.projects.len();
+        if len == 0 { return; }
+        let i = self.project_state.selected().unwrap_or(0);
+        self.project_state.select(Some(if i == 0 { len - 1 } else { i - 1 }));
+        self.reset_todo_selection();
+    }
+
+    fn project_add(&mut self) {
+        if !self.project_input.is_empty() {
+            self.projects.push(Project {
+                name: self.project_input.drain(..).collect(),
+                todos: Vec::new(),
+            });
+            self.project_state.select(Some(self.projects.len() - 1));
+            self.todo_state.select(None);
+        }
+        self.adding_project = false;
+    }
+
+    fn project_delete(&mut self) {
+        if let Some(i) = self.project_state.selected() {
+            if i < self.projects.len() {
+                self.projects.remove(i);
+                if !self.projects.is_empty() {
+                    let new_idx = if i >= self.projects.len() { self.projects.len() - 1 } else { i };
+                    self.project_state.select(Some(new_idx));
+                    self.reset_todo_selection();
+                } else {
+                    self.project_state.select(None);
+                    self.todo_state.select(None);
+                }
+            }
+        }
+    }
+
+    fn reset_todo_selection(&mut self) {
+        if let Some(project) = self.project_state.selected().and_then(|i| self.projects.get(i)) {
+            if project.todos.is_empty() {
+                self.todo_state.select(None);
+            } else {
+                self.todo_state.select(Some(0));
+            }
+        } else {
+            self.todo_state.select(None);
+        }
+    }
+
     // -- Todo actions --
 
     fn todo_next(&mut self) {
-        let len = self.todos.len();
-        if len == 0 { return; }
-        let i = self.todo_state.selected().unwrap_or(0);
-        self.todo_state.select(Some((i + 1) % len));
+        if let Some(project) = self.project_state.selected().and_then(|i| self.projects.get(i)) {
+            let len = project.todos.len();
+            if len == 0 { return; }
+            let i = self.todo_state.selected().unwrap_or(0);
+            self.todo_state.select(Some((i + 1) % len));
+        }
     }
 
     fn todo_prev(&mut self) {
-        let len = self.todos.len();
-        if len == 0 { return; }
-        let i = self.todo_state.selected().unwrap_or(0);
-        self.todo_state.select(Some(if i == 0 { len - 1 } else { i - 1 }));
+        if let Some(project) = self.project_state.selected().and_then(|i| self.projects.get(i)) {
+            let len = project.todos.len();
+            if len == 0 { return; }
+            let i = self.todo_state.selected().unwrap_or(0);
+            self.todo_state.select(Some(if i == 0 { len - 1 } else { i - 1 }));
+        }
     }
 
     fn todo_toggle(&mut self) {
         if let Some(i) = self.todo_state.selected() {
-            if i < self.todos.len() {
-                self.todos[i].done = !self.todos[i].done;
+            if let Some(project) = self.project_state.selected().and_then(|pi| self.projects.get_mut(pi)) {
+                if i < project.todos.len() {
+                    project.todos[i].done = !project.todos[i].done;
+                }
             }
         }
     }
 
     fn todo_delete(&mut self) {
         if let Some(i) = self.todo_state.selected() {
-            if i < self.todos.len() {
-                self.todos.remove(i);
-                if !self.todos.is_empty() {
-                    let new_idx = if i >= self.todos.len() { self.todos.len() - 1 } else { i };
-                    self.todo_state.select(Some(new_idx));
-                } else {
-                    self.todo_state.select(None);
+            if let Some(project) = self.project_state.selected().and_then(|pi| self.projects.get_mut(pi)) {
+                if i < project.todos.len() {
+                    project.todos.remove(i);
+                    if !project.todos.is_empty() {
+                        let new_idx = if i >= project.todos.len() { project.todos.len() - 1 } else { i };
+                        self.todo_state.select(Some(new_idx));
+                    } else {
+                        self.todo_state.select(None);
+                    }
                 }
             }
         }
@@ -217,11 +318,13 @@ impl App {
 
     fn todo_add(&mut self) {
         if !self.todo_input.is_empty() {
-            self.todos.push(TodoItem {
-                text: self.todo_input.drain(..).collect(),
-                done: false,
-            });
-            self.todo_state.select(Some(self.todos.len() - 1));
+            if let Some(project) = self.project_state.selected().and_then(|pi| self.projects.get_mut(pi)) {
+                project.todos.push(TodoItem {
+                    text: self.todo_input.drain(..).collect(),
+                    done: false,
+                });
+                self.todo_state.select(Some(project.todos.len() - 1));
+            }
         }
         self.adding_todo = false;
     }
@@ -244,21 +347,121 @@ impl App {
 }
 
 // ============================================================
+// Storage — SQLite-backed persistence
+// ============================================================
+
+fn db_path() -> PathBuf {
+    let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("ratatui-showcase");
+    std::fs::create_dir_all(&path).expect("failed to create data directory");
+    path.push("app.db");
+    path
+}
+
+fn init_db(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            name     TEXT    NOT NULL,
+            position INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS todos (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            text       TEXT    NOT NULL,
+            done       INTEGER NOT NULL DEFAULT 0,
+            position   INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );",
+    )
+}
+
+fn load_projects(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
+    let mut project_stmt = conn.prepare("SELECT id, name FROM projects ORDER BY position")?;
+    let project_rows: Vec<(i64, String)> = project_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    let mut projects = Vec::new();
+    for (id, name) in project_rows {
+        let mut todo_stmt =
+            conn.prepare("SELECT text, done FROM todos WHERE project_id = ?1 ORDER BY position")?;
+        let todos: Vec<TodoItem> = todo_stmt
+            .query_map(params![id], |row| {
+                Ok(TodoItem {
+                    text: row.get(0)?,
+                    done: row.get::<_, bool>(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        projects.push(Project { name, todos });
+    }
+
+    Ok(projects)
+}
+
+fn save_projects(conn: &Connection, projects: &[Project]) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM todos", [])?;
+    tx.execute("DELETE FROM projects", [])?;
+
+    for (pos, project) in projects.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO projects (name, position) VALUES (?1, ?2)",
+            params![project.name, pos],
+        )?;
+        let project_id = conn.last_insert_rowid();
+        for (todo_pos, todo) in project.todos.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO todos (project_id, text, done, position) VALUES (?1, ?2, ?3, ?4)",
+                params![project_id, todo.text, todo.done, todo_pos],
+            )?;
+        }
+    }
+
+    tx.commit()
+}
+
+fn default_projects() -> Vec<Project> {
+    vec![
+        Project {
+            name: "Learn Ratatui".into(),
+            todos: vec![
+                TodoItem { text: "Learn ratatui basics".into(), done: true },
+                TodoItem { text: "Build a layout with constraints".into(), done: true },
+                TodoItem { text: "Add keyboard navigation".into(), done: false },
+                TodoItem { text: "Style widgets with colors".into(), done: false },
+            ],
+        },
+        Project {
+            name: "Build App".into(),
+            todos: vec![
+                TodoItem { text: "Create a stateful list".into(), done: false },
+                TodoItem { text: "Handle events in a loop".into(), done: false },
+                TodoItem { text: "Deploy to production 🚀".into(), done: false },
+            ],
+        },
+    ]
+}
+
+// ============================================================
 // Main — setup terminal, run event loop, restore terminal
 // ============================================================
 
 fn main() -> io::Result<()> {
-    // Setup
+    let conn = Connection::open(db_path()).expect("failed to open database");
+    init_db(&conn).expect("failed to initialize database");
+    let projects = load_projects(&conn).unwrap_or_default();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Run
-    let result = run_app(&mut terminal);
+    let result = run_app(&mut terminal, projects);
 
-    // Restore
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -267,15 +470,23 @@ fn main() -> io::Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    if let Err(e) = result {
-        eprintln!("Error: {e}");
+    match result {
+        Ok(projects) => {
+            if let Err(e) = save_projects(&conn, &projects) {
+                eprintln!("Warning: failed to save data: {e}");
+            }
+        }
+        Err(e) => eprintln!("Error: {e}"),
     }
 
     Ok(())
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    let mut app = App::new();
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    projects: Vec<Project>,
+) -> io::Result<Vec<Project>> {
+    let mut app = App::new(projects);
     let tick_rate = Duration::from_millis(50);
     let mut last_tick = Instant::now();
 
@@ -302,6 +513,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     continue;
                 }
 
+                // If adding a project, handle text input
+                if app.adding_project {
+                    match key.code {
+                        KeyCode::Enter => app.project_add(),
+                        KeyCode::Esc => {
+                            app.adding_project = false;
+                            app.project_input.clear();
+                        }
+                        KeyCode::Backspace => { app.project_input.pop(); }
+                        KeyCode::Char(c) => app.project_input.push(c),
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Help popup
                 if app.show_help {
                     match key.code {
@@ -309,6 +535,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             app.show_help = false;
                         }
                         _ => {}
+                    }
+                    continue;
+                }
+
+                // Delete confirmation
+                if app.confirm_delete.is_some() {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            if let Some(target) = app.confirm_delete.take() {
+                                match target {
+                                    DeleteTarget::Project(_) => app.project_delete(),
+                                    DeleteTarget::Todo { .. } => app.todo_delete(),
+                                }
+                            }
+                        }
+                        _ => app.confirm_delete = None,
                     }
                     continue;
                 }
@@ -344,21 +586,68 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         }
 
         if app.should_quit {
-            return Ok(());
+            return Ok(app.projects);
         }
     }
 }
 
 fn handle_todo_keys(app: &mut App, key: KeyCode) {
     match key {
-        KeyCode::Down | KeyCode::Char('j') => app.todo_next(),
-        KeyCode::Up | KeyCode::Char('k') => app.todo_prev(),
-        KeyCode::Enter | KeyCode::Char(' ') => app.todo_toggle(),
-        KeyCode::Char('a') => {
-            app.adding_todo = true;
-            app.todo_input.clear();
+        KeyCode::Left | KeyCode::Char('h') => {
+            app.todo_focus = TodoFocus::Projects;
         }
-        KeyCode::Char('d') | KeyCode::Delete => app.todo_delete(),
+        KeyCode::Right | KeyCode::Char('l') => {
+            if !app.projects.is_empty() {
+                app.todo_focus = TodoFocus::Todos;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => match app.todo_focus {
+            TodoFocus::Projects => app.project_next(),
+            TodoFocus::Todos => app.todo_next(),
+        },
+        KeyCode::Up | KeyCode::Char('k') => match app.todo_focus {
+            TodoFocus::Projects => app.project_prev(),
+            TodoFocus::Todos => app.todo_prev(),
+        },
+        KeyCode::Enter | KeyCode::Char(' ') => match app.todo_focus {
+            TodoFocus::Projects => {
+                if !app.projects.is_empty() {
+                    app.todo_focus = TodoFocus::Todos;
+                }
+            }
+            TodoFocus::Todos => app.todo_toggle(),
+        },
+        KeyCode::Char('a') => match app.todo_focus {
+            TodoFocus::Projects => {
+                app.adding_project = true;
+                app.project_input.clear();
+            }
+            TodoFocus::Todos => {
+                if !app.projects.is_empty() {
+                    app.adding_todo = true;
+                    app.todo_input.clear();
+                }
+            }
+        },
+        KeyCode::Char('d') | KeyCode::Delete => match app.todo_focus {
+            TodoFocus::Projects => {
+                if let Some(idx) = app.project_state.selected() {
+                    if idx < app.projects.len() {
+                        app.confirm_delete = Some(DeleteTarget::Project(idx));
+                    }
+                }
+            }
+            TodoFocus::Todos => {
+                if let (Some(pi), Some(ti)) =
+                    (app.project_state.selected(), app.todo_state.selected())
+                {
+                    if pi < app.projects.len() && ti < app.projects[pi].todos.len() {
+                        app.confirm_delete =
+                            Some(DeleteTarget::Todo { project_idx: pi, todo_idx: ti });
+                    }
+                }
+            }
+        },
         _ => {}
     }
 }
@@ -463,9 +752,28 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_help_popup(f, size);
     }
 
-    // -- Todo input popup --
+    // -- Input popups --
     if app.adding_todo {
-        draw_input_popup(f, app, size);
+        draw_input_popup(f, &app.todo_input, " ✏️  Add Todo ", "Type your todo and press Enter (Esc to cancel):", size);
+    }
+    if app.adding_project {
+        draw_input_popup(f, &app.project_input, " 📁 Add Project ", "Type project name and press Enter (Esc to cancel):", size);
+    }
+
+    if let Some(target) = &app.confirm_delete {
+        let message = match target {
+            DeleteTarget::Project(idx) => {
+                let name = app.projects.get(*idx).map_or("?", |p| &p.name);
+                format!("Delete project \"{name}\" and all its todos?")
+            }
+            DeleteTarget::Todo { project_idx, todo_idx } => {
+                let text = app.projects.get(*project_idx)
+                    .and_then(|p| p.todos.get(*todo_idx))
+                    .map_or("?", |t| &t.text);
+                format!("Delete todo \"{text}\"?")
+            }
+        };
+        draw_confirm_popup(f, &message, size);
     }
 }
 
@@ -476,34 +784,43 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn draw_todo_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Percentage(45),
+            Constraint::Percentage(30),
+        ])
         .split(area);
 
-    // Left: todo list
-    let done_count = app.todos.iter().filter(|t| t.done).count();
-    let total = app.todos.len();
-
-    let items: Vec<ListItem> = app
-        .todos
+    // Left: project list
+    let project_items: Vec<ListItem> = app
+        .projects
         .iter()
-        .map(|todo| {
-            let (icon, style) = if todo.done {
-                ("✓", Style::default().fg(Color::Green).add_modifier(Modifier::CROSSED_OUT))
-            } else {
-                ("○", Style::default().fg(Color::White))
-            };
+        .map(|project| {
+            let done = project.todos.iter().filter(|t| t.done).count();
+            let total = project.todos.len();
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {} ", icon), Style::default().fg(if todo.done { Color::Green } else { Color::DarkGray })),
-                Span::styled(&todo.text, style),
+                Span::styled(" 📁 ", Style::default().fg(Color::Yellow)),
+                Span::raw(&project.name),
+                Span::styled(
+                    format!(" ({done}/{total})"),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]))
         })
         .collect();
 
-    let list = List::new(items)
+    let project_border = if app.todo_focus == TodoFocus::Projects {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let project_list = List::new(project_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Todo ({done_count}/{total} done) "))
+                .border_style(project_border)
+                .title(format!(" Projects ({}) ", app.projects.len()))
                 .title_style(Style::default().fg(Color::Cyan).bold()),
         )
         .highlight_style(
@@ -513,18 +830,74 @@ fn draw_todo_tab(f: &mut Frame, app: &mut App, area: Rect) {
         )
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(list, chunks[0], &mut app.todo_state);
+    f.render_stateful_widget(project_list, chunks[0], &mut app.project_state);
 
-    // Right: instructions + progress
+    // Middle: todo list for selected project
+    let (todo_items, done_count, total, project_name) =
+        if let Some(project) = app.project_state.selected().and_then(|i| app.projects.get(i)) {
+            let done = project.todos.iter().filter(|t| t.done).count();
+            let total = project.todos.len();
+            let items: Vec<ListItem> = project
+                .todos
+                .iter()
+                .map(|todo| {
+                    let (icon, style) = if todo.done {
+                        ("✓", Style::default().fg(Color::Green).add_modifier(Modifier::CROSSED_OUT))
+                    } else {
+                        ("○", Style::default().fg(Color::White))
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!(" {icon} "),
+                            Style::default().fg(if todo.done { Color::Green } else { Color::DarkGray }),
+                        ),
+                        Span::styled(&todo.text, style),
+                    ]))
+                })
+                .collect();
+            (items, done, total, Some(project.name.clone()))
+        } else {
+            (vec![], 0, 0, None)
+        };
+
+    let todo_border = if app.todo_focus == TodoFocus::Todos {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let todo_title = match &project_name {
+        Some(name) => format!(" {name} ({done_count}/{total} done) "),
+        None => " Select a project ".to_string(),
+    };
+
+    let todo_list = List::new(todo_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(todo_border)
+                .title(todo_title)
+                .title_style(Style::default().fg(Color::Cyan).bold()),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(todo_list, chunks[1], &mut app.todo_state);
+
+    // Right: progress + instructions
     let progress = if total > 0 { done_count as f64 / total as f64 } else { 0.0 };
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // progress gauge
-            Constraint::Min(0),    // instructions
+            Constraint::Length(3),
+            Constraint::Min(0),
         ])
-        .split(chunks[1]);
+        .split(chunks[2]);
 
     let gauge = Gauge::default()
         .block(Block::default().borders(Borders::ALL).title(" Progress "))
@@ -538,49 +911,38 @@ fn draw_todo_tab(f: &mut Frame, app: &mut App, area: Rect) {
 
     f.render_widget(gauge, right_chunks[0]);
 
+    let focus_label = match app.todo_focus {
+        TodoFocus::Projects => "Projects",
+        TodoFocus::Todos => "Todos",
+    };
+
     let help_text = vec![
         Line::from(""),
+        Line::from(Span::styled(
+            format!("  Focus: {focus_label}"),
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(""),
         Line::from(vec![
-            Span::styled("  ↑/↓ or j/k", Style::default().fg(Color::Yellow).bold()),
+            Span::styled("  ←/→ h/l", Style::default().fg(Color::Yellow).bold()),
+            Span::raw("  Switch pane"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ↑/↓ j/k", Style::default().fg(Color::Yellow).bold()),
             Span::raw("  Navigate"),
         ]),
         Line::from(vec![
-            Span::styled("  Enter/Space", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("  Toggle done"),
+            Span::styled("  Enter", Style::default().fg(Color::Yellow).bold()),
+            Span::raw("     Toggle / Enter"),
         ]),
         Line::from(vec![
             Span::styled("  a", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("          Add new todo"),
+            Span::raw("         Add item"),
         ]),
         Line::from(vec![
             Span::styled("  d/Del", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("      Delete todo"),
+            Span::raw("     Delete item"),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  This demonstrates:",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  • StatefulWidget (ListState)",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  • Highlight styles",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  • Dynamic list modification",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  • Popup input overlay",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  • Gauge widget for progress",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
 
     let instructions = Paragraph::new(help_text)
@@ -856,6 +1218,7 @@ fn draw_about_tab(f: &mut Frame, area: Rect) {
         Line::from("    ✓ Text input handling in raw mode"),
         Line::from("    ✓ Terminal setup/restore (raw mode, alternate screen)"),
         Line::from("    ✓ Global vs tab-specific keybindings"),
+        Line::from("    ✓ Persistent storage (embedded SQLite)"),
         Line::from(""),
         Line::from(Span::styled(
             "  Built with ratatui + crossterm",
@@ -915,10 +1278,11 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         Line::from("    q / Esc           Quit"),
         Line::from(""),
         Line::from(Span::styled("  Todo Tab", Style::default().fg(Color::Yellow).bold())),
+        Line::from("    ←/→ or h/l        Switch pane"),
         Line::from("    ↑/↓ or j/k        Navigate"),
-        Line::from("    Enter / Space     Toggle done"),
-        Line::from("    a                 Add new todo"),
-        Line::from("    d / Delete        Delete todo"),
+        Line::from("    Enter / Space     Enter project / Toggle"),
+        Line::from("    a                 Add project or todo"),
+        Line::from("    d / Delete        Delete item"),
         Line::from(""),
         Line::from(Span::styled("  Table Tab", Style::default().fg(Color::Yellow).bold())),
         Line::from("    ↑/↓ or j/k        Navigate rows"),
@@ -943,7 +1307,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
     f.render_widget(popup, popup_area);
 }
 
-fn draw_input_popup(f: &mut Frame, app: &App, area: Rect) {
+fn draw_input_popup(f: &mut Frame, input_text: &str, title: &str, label_text: &str, area: Rect) {
     let popup_area = centered_rect(50, 20, area);
     f.render_widget(Clear, popup_area);
 
@@ -955,19 +1319,51 @@ fn draw_input_popup(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" ✏️  Add Todo ")
+        .title(title)
         .title_style(Style::default().fg(Color::Cyan).bold())
         .style(Style::default().bg(Color::Black));
     f.render_widget(block, popup_area);
 
     let label = Paragraph::new(Span::styled(
-        "  Type your todo and press Enter (Esc to cancel):",
+        format!("  {label_text}"),
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(label, input_chunks[0]);
 
-    let input = Paragraph::new(format!("  {}_", app.todo_input))
+    let input = Paragraph::new(format!("  {input_text}_"))
         .style(Style::default().fg(Color::Yellow))
         .block(Block::default().borders(Borders::ALL).title(" Input "));
     f.render_widget(input, input_chunks[1]);
+}
+
+fn draw_confirm_popup(f: &mut Frame, message: &str, area: Rect) {
+    let popup_area = centered_rect(50, 20, area);
+    f.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {message}"),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y / Enter", Style::default().fg(Color::Red).bold()),
+            Span::raw("  confirm   "),
+            Span::styled("any other key", Style::default().fg(Color::Green).bold()),
+            Span::raw("  cancel"),
+        ]),
+    ];
+
+    let popup = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" ⚠ Confirm Delete ")
+                .title_style(Style::default().fg(Color::Red).bold())
+                .style(Style::default().bg(Color::Black)),
+        )
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(popup, popup_area);
 }
